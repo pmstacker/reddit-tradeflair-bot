@@ -16,6 +16,10 @@ my $confirmedRE		= qr/^Confirmed:/;
 
 my $blackListedTraders	= qr/^(ShinyBot|AutoModerator)$/;
 my $botNames = qr/^(ShinyBot|PMsBot)$/;
+my $verifiedTrigger = qr/^Trade verified\!$/;
+my $maxStack = 15;
+my $maxEmpties = 5;
+my $expiredFlairCSS = "expired";
 
 # Read from the statefile
 sub readState() {
@@ -56,6 +60,10 @@ sub writeState() {
 }
 
 readState();
+
+if(! exists ($state->{'commentStack'})) {
+	$state->{'commentStack'} = ();
+}
 
 # Create a Reddit::Client object and authorize in one step
 my $reddit = new Reddit::Client(
@@ -130,6 +138,30 @@ sub fetchObject($) {
 	return $data->{'data'}->{'children'}->[0]->{'data'};
 }
 
+sub updateLinkFlair($$$) {
+	my $linkId = shift;
+	my $flairText = shift;
+	my $flairClass = shift;
+
+	my $data;
+
+	while(!$data) {
+		$data = $reddit->json_request(
+			"POST",
+			sprintf("/api/flair"),
+			{},
+			{
+				"api_type" => "json",
+				"r" => $config->{'commentSub'},
+				"link" => $linkId,
+				"css_class" => $flairClass,
+				"text" => $flairText
+			},
+		) or sleep(5);
+	}
+	return $data;
+}
+
 # Post new flairs for the two users
 sub updateFlairs($$$$) {
 	my $opName = shift;
@@ -172,7 +204,18 @@ sub postComment($$) {
 
 while(1) {
 	my $comments = fetchNewComments();
-	COMMENT: foreach my $_comment (@$comments) {
+	if($#$comments < 0) {
+		$empties++;
+	} else {
+		$empties = 0;
+	}
+	if($empties > $maxEmpties) {
+		print "Rolling back\n";
+		pop(@{$state->{'commentStack'}});
+		$state->{'lastCommentChecked'} = pop(@{$state->{'commentStack'}});
+		$empties = 0;
+	}
+	COMMENT: foreach my $_comment (reverse @$comments) {
 		my $opName;
 		my $opFlair;
 		my $traderName;
@@ -183,8 +226,26 @@ while(1) {
 
 		printf("%s [%s] said: %s\n", $comment->{'author'}, $opFlair, $comment->{'body'});
 
+		if($comment->{'body'} =~ /EXPIRED\!/i) {
+			# OP posted it
+			if($comment->{'author'} eq $comment->{'link_author'}) {
+				$opName = $comment->{'link_author'};
+				my $link = fetchObject($comment->{'link_id'});
+				my $newFlair;
+				if(defined($link->{'link_flair_text'})) {
+					printf("Current flair: %s\n", $link->{'link_flair_text'});
+					next COMMENT if ($link->{'link_flair_text'} =~ /EXPIRED/);
+					$newFlair = sprintf("EXPIRED (%s)", $link->{'link_flair_text'});
+				} else {
+					$newFlair = sprintf("EXPIRED");
+				}
+				printf("Set to new flair: %s\n", $newFlair);
+				updateLinkFlair($comment->{'link_id'}, $newFlair, $expiredFlairCSS);
+			}
+		}
+
 		# The user said trade verified!
-		if($comment->{'body'} =~ /Trade verified\!/i) {
+		if($comment->{'body'} =~ /$verifiedTrigger/) {
 
 			# OP posted it
 			if($comment->{'author'} eq $comment->{'link_author'}) {
@@ -248,6 +309,10 @@ while(1) {
 		}
 		sleep(1);
 		$state->{'lastCommentChecked'} = $comment->{'name'};
+		push(@{$state->{'commentStack'}}, $comment->{'name'});
+		while($#{$state->{'commentStack'}} > $maxStack) {
+			shift(@{$state->{'commentStack'}});
+		}
 		writeState();
 	}
 	sleep(10);
